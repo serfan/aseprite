@@ -1,63 +1,124 @@
+Skip to content
+Navigation Menu
+wuxianggujun
+aseprite
+
+Type / to search
+Code
+Pull requests
+Actions
+Projects
+Security
+Insights
+build
+Update build.yml #11
+Jobs
+Run details
+Workflow file for this run
+.github/workflows/build.yml at 9e470c1
+# GitHub Actions Workflow — Windows-only **Release** build for Aseprite (GUI + Lua)
+# Save as .github/workflows/build.yml
+
 name: build
-on: [push, pull_request]
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest]
-        build_type: [Release]
-        enable_ui: [on]
-        include:
-          - os: windows-latest
-            build_type: Release
-            enable_ui: on
+    runs-on: windows-latest
+
     steps:
+    #######################################################################
+    # 1️⃣  Checkout (含子模块)
+    #######################################################################
     - uses: actions/checkout@v4
       with:
-        submodules: 'recursive'
-    - name: ccache
-      uses: hendrikmuhs/ccache-action@v1
-      if: runner.os == 'Linux'
-      with:
-        key: ${{ matrix.os }}-${{ matrix.enable_ui }}
-    - uses: seanmiddleditch/gha-setup-ninja@master
+        submodules: recursive
+
+    #######################################################################
+    # 2️⃣  工具链：Ninja + MSVC 环境
+    #######################################################################
+    - uses: aseprite/get-ninja@main
     - uses: ilammy/msvc-dev-cmd@v1
-      if: runner.os == 'Windows'
-    - name: Install Dependencies
+
+    #######################################################################
+    # 3️⃣  下载匹配版本的 Skia
+    #######################################################################
+    - name: Download Skia
       shell: bash
       run: |
-        if [[ "${{ runner.os }}" == "Linux" ]] ; then
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            libx11-dev libxcursor-dev libxi-dev
-        fi
-    - name: Generating Makefiles
+        this_dir=$(cygpath "${{ github.workspace }}")
+        skia_url=$(source "$this_dir/laf/misc/skia-url.sh" | xargs)
+        skia_file=$(basename "$skia_url")
+        echo "Skia URL → $skia_url"
+        curl -L -o "$skia_file" "$skia_url"
+        unzip -q "$skia_file" -d skia
+    #######################################################################
+    # 4️⃣  安装 **OpenSSL 1.1**（仅官方安装包，彻底摆脱 Chocolatey）
+    #######################################################################
+    - name: Install OpenSSL 1.1 runtime
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # 下载官方 Win64 安装包（1.1.1w；若官网后续更新补丁，只需改文件名）
+        $url = 'https://slproweb.com/download/Win64OpenSSL_Light-1_1_1w.exe'
+        Write-Host "⬇️  Downloading $url"
+        Invoke-WebRequest -Uri $url -OutFile openssl.exe
+        # 静默安装到 C:\openssl
+        Write-Host "⚙️  Installing OpenSSL 1.1 to C:\\openssl ..."
+        Start-Process -FilePath .\openssl.exe `
+          -ArgumentList '/verysilent','/sp-','/suppressmsgboxes','/norestart','/dir="C:\openssl"' `
+          -NoNewWindow -Wait
+        # 确认 DLL 是否存在
+        if (-not (Test-Path 'C:\openssl\bin\libcrypto-1_1-x64.dll')) {
+          throw '❌ OpenSSL DLLs not found after install.'
+        }
+        Write-Host '✅  OpenSSL 1.1 installed.'
+    #######################################################################
+    # 5️⃣  CMake 配置（Release + Skia + Lua）
+    #######################################################################
+    - name: Configure CMake
       shell: bash
       run: |
-        if [[ "${{ runner.os }}" == "Windows" ]] ; then
-          export enable_ccache=off
-        else
-          export enable_ccache=on
-        fi
-        curl -L https://github.com/blueloveTH/aseprite/releases/download/v0.01/skia.zip --output skia.zip
-        7z x skia.zip
         cmake -S . -B build -G Ninja \
-          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-          -DENABLE_UI=${{ matrix.enable_ui }} \
-          -DENABLE_CCACHE=$enable_ccache \
+          -DCMAKE_BUILD_TYPE=Release \
           -DLAF_BACKEND=skia \
-          -DSKIA_DIR=./skia \
-          -DSKIA_LIBRARY_DIR=./skia/out/Release-x64 \
-          -DSKIA_LIBRARY=./skia/out/Release-x64/skia.lib
-    - name: Compiling
+          -DSKIA_DIR=$(realpath skia) \
+          -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-x64) \
+          -DENABLE_SCRIPTING=ON \
+          -DENABLE_CCACHE=OFF
+    #######################################################################
+    # 6️⃣  编译
+    #######################################################################
+    - name: Build
       shell: bash
+      run: cmake --build build --config Release
+
+    #######################################################################
+    # 7️⃣  复制 OpenSSL DLLs 到 exe 同目录
+    #######################################################################
+    - name: Bundle OpenSSL DLLs
+      shell: pwsh
       run: |
-        cd build && ninja
-    - uses: actions/upload-artifact@v4
+        $ErrorActionPreference = 'Stop'
+        $outDir = "${{ github.workspace }}\build\bin"
+        $srcDir = 'C:\openssl\bin'
+        Copy-Item "$srcDir\libcrypto*-1_1*-x64.dll" -Destination $outDir -Force
+        Copy-Item "$srcDir\libssl*-1_1*-x64.dll"    -Destination $outDir -Force
+        Write-Host "✅  Copied OpenSSL DLLs to $outDir"
+    #######################################################################
+    # 8️⃣  上传产物
+    #######################################################################
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
-        name: aseprite
+        name: aseprite-windows-release
         path: |
-          D:/a/aseprite/aseprite/build/bin/data
-          D:/a/aseprite/aseprite/build/bin/aseprite.exe
+          build/bin/aseprite.exe
+          build/bin/libcrypto*-1_1*-x64.dll
+          build/bin/libssl*-1_1*-x64.dll
+          build/bin/data/**
+Update build.yml · wuxianggujun/aseprite@9e470c1 
